@@ -6,10 +6,10 @@
 #define ARENA_IMPLEMENTATION
 #include "arena.h"
 
-#define NX 64
-#define NY 64
-#define NZ 64
-#define DT 0.001
+#define NX 96
+#define NY 96
+#define NZ 96
+#define DT 0.000001
 #define STEPS 1000
 #define Lx 1.0
 #define Ly 1.0
@@ -44,15 +44,15 @@ Arena tempArena = {0};
 
 void allocate_fields(Fields *f) {
     int n = N;
-    f->alpha = arena_alloc(&mainArena, sizeof(double)*n);
+    f->alpha = arena_alloc(&tempArena, sizeof(double)*n);
     for (int d = 0; d < 3; d++) {
-        f->beta[d] = arena_alloc(&mainArena, sizeof(double)*n);
-        f->B[d] = arena_alloc(&mainArena, sizeof(double)*n);
+        f->beta[d] = arena_alloc(&tempArena, sizeof(double)*n);
+        f->B[d] = arena_alloc(&tempArena, sizeof(double)*n);
     }
     for (int a = 0; a < 3; a++) {
         for (int b = 0; b < 3; b++) {
-            f->gamma[a][b] = arena_alloc(&mainArena, sizeof(double)*n);
-            f->K[a][b] = arena_alloc(&mainArena, sizeof(double)*n);
+            f->gamma[a][b] = arena_alloc(&tempArena, sizeof(double)*n);
+            f->K[a][b] = arena_alloc(&tempArena, sizeof(double)*n);
         }
     }
 }
@@ -99,30 +99,56 @@ void initialize_fields(Fields *f, MetricType metric) {
     }
 }
 
+typedef struct {
+    int start;         // starting i index
+    int end;           // ending i index (non-inclusive)
+    int dim;           // which dimension derivative (0, 1, or 2)
+    fftw_complex *fft_data; // pointer to fft_data array
+} SpectralThreadData;
+
+void *spectral_deriv_thread(void *arg) {
+    SpectralThreadData *data = (SpectralThreadData *) arg;
+    int dim = data->dim;
+    for (int i = data->start; i < data->end; i++){
+        double kx = (i < NX/2) ? (2*M_PI*i/Lx) : (2*M_PI*(i-NX)/Lx);
+        for (int j = 0; j < NY; j++){
+            double ky = (j < NY/2) ? (2*M_PI*j/Ly) : (2*M_PI*(j-NY)/Ly);
+            for (int k = 0; k < NZ; k++){
+                double kz = (k < NZ/2) ? (2*M_PI*k/Lz) : (2*M_PI*(k-NZ)/Lz);
+                int idx = IDX(i,j,k);
+                double k_val = (dim==0) ? kx : (dim==1) ? ky : kz;
+                double a = data->fft_data[idx][0];
+                double b = data->fft_data[idx][1];
+                data->fft_data[idx][0] = -b * k_val;
+                data->fft_data[idx][1] =  a * k_val;
+            }
+        }
+    }
+    return NULL;
+}
+
 // Spectral derivative (in dimension 'dim': 0=x,1=y,2=z) using FFTW.
 void spectral_derivative(double *in, double *out, int dim) {
     fftw_complex *fft_data = fftw_malloc(sizeof(fftw_complex)*N);
     fftw_plan plan_forward  = fftw_plan_dft_r2c_3d(NX, NY, NZ, in, fft_data, FFTW_ESTIMATE);
     fftw_plan plan_backward = fftw_plan_dft_c2r_3d(NX, NY, NZ, fft_data, out, FFTW_ESTIMATE);
     fftw_execute(plan_forward);
-    int i, j, k;
-    double kx, ky, kz, k_val;
-    for (i = 0; i < NX; i++){
-        kx = (i < NX/2) ? (2*M_PI*i/Lx) : (2*M_PI*(i-NX)/Lx);
-        for (j = 0; j < NY; j++){
-            ky = (j < NY/2) ? (2*M_PI*j/Ly) : (2*M_PI*(j-NY)/Ly);
-            for (k = 0; k < NZ; k++){
-                kz = (k < NZ/2) ? (2*M_PI*k/Lz) : (2*M_PI*(k-NZ)/Lz);
-                int idx = IDX(i,j,k);
-                if(dim == 0) k_val = kx;
-                else if(dim == 1) k_val = ky;
-                else k_val = kz;
-                double a = fft_data[idx][0], b = fft_data[idx][1];
-                fft_data[idx][0] = -b * k_val;
-                fft_data[idx][1] =  a * k_val;
-            }
-        }
+    
+    // Parallelize the loop that multiplies by i*k_val.
+    pthread_t threads[NUM_THREADS];
+    SpectralThreadData threadData[NUM_THREADS];
+    int chunk = NX / NUM_THREADS;
+    for (int t = 0; t < NUM_THREADS; t++) {
+        threadData[t].start = t * chunk;
+        threadData[t].end = (t == NUM_THREADS - 1) ? NX : (t + 1) * chunk;
+        threadData[t].dim = dim;
+        threadData[t].fft_data = fft_data;
+        pthread_create(&threads[t], NULL, spectral_deriv_thread, &threadData[t]);
     }
+    for (int t = 0; t < NUM_THREADS; t++) {
+        pthread_join(threads[t], NULL);
+    }
+    
     fftw_execute(plan_backward);
     for (int n = 0; n < N; n++)
         out[n] /= N;
@@ -352,6 +378,40 @@ void* combine_thread(void *arg) {
     return NULL;
 }
 
+typedef struct {
+    double *dest;
+    double *src;   // base field value (from F)
+    double *delta; // derivative field (from a k-stage)
+    double coeff;
+    int start, end;
+} UpdateData;
+
+void *update_array_thread(void *arg) {
+    UpdateData *data = (UpdateData*) arg;
+    for (int i = data->start; i < data->end; i++) {
+        data->dest[i] = data->src[i] + data->coeff * data->delta[i];
+    }
+    return NULL;
+}
+/* Helper: Update all components for one "field" of F_temp using a coefficient.
+   For scalar fields (alpha) and for each tensor component in gamma, K, beta, B.
+*/
+void parallel_update(double *dest, double *src, double *delta, double coeff) {
+    pthread_t threads[NUM_THREADS];
+    UpdateData threadData[NUM_THREADS];
+    int chunk = N / NUM_THREADS;
+    for (int t = 0; t < NUM_THREADS; t++) {
+        threadData[t].start = t * chunk;
+        threadData[t].end = (t == NUM_THREADS - 1) ? N : (t + 1) * chunk;
+        threadData[t].dest = dest;
+        threadData[t].src = src;
+        threadData[t].delta = delta;
+        threadData[t].coeff = coeff;
+        pthread_create(&threads[t], NULL, update_array_thread, &threadData[t]);
+    }
+    for (int t = 0; t < NUM_THREADS; t++)
+        pthread_join(threads[t], NULL);
+}
 // RK4 integration step using global tempArena for temporary allocations.
 void RK4_step(Fields *F) {
     Fields k1, k2, k3, k4, F_temp;
